@@ -629,7 +629,7 @@ function M.setup(user_config)
   api.nvim_create_autocmd({ 'VimEnter', 'BufRead', 'SessionLoadPost', 'DirChanged' }, {
     group = AUGROUP_NAME,
     callback = function(args)
-      local gitdir = vim.fs.find('.git', { upward = true, path = fn.getcwd() })
+      local gitdir = vim.fs.find('.git', { upward = true, path = fn.getcwd() })[1]
       if not gitdir or not vim.loop.fs_stat(gitdir) or state.current_watcher_dir == fn.getcwd() then return end
       stop_running_watchers(gitdir)
       fetch_conflicts(args.buf)
