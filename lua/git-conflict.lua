@@ -217,13 +217,20 @@ end
 ---@return integer? extmark_id
 local function hl_range(bufnr, hl, range_start, range_end)
   if not range_start or not range_end then return end
-  return api.nvim_buf_set_extmark(bufnr, NAMESPACE, range_start, 0, {
+  if not api.nvim_buf_is_valid(bufnr) then return end
+  local line_count = api.nvim_buf_line_count(bufnr)
+  if range_start < 0 or range_start >= line_count then return end
+  -- end_row is exclusive-ish; clamp it so stale positions can't go out of range
+  range_end = math.min(range_end, line_count - 1)
+  if range_end < range_start then return end
+  local ok, id = pcall(api.nvim_buf_set_extmark, bufnr, NAMESPACE, range_start, 0, {
     hl_group = hl,
     hl_eol = true,
     hl_mode = 'combine',
     end_row = range_end,
     priority = PRIORITY,
   })
+  if ok then return id end
 end
 
 ---Add highlights and additional data to each section heading of the conflict marker
@@ -236,39 +243,63 @@ end
 ---@param hl_group string
 ---@param label string
 ---@param lnum integer
----@return integer extmark id
-local function draw_section_label(bufnr, hl_group, label, lnum)
-  local remaining_space = api.nvim_win_get_width(0) - api.nvim_strwidth(label)
-  return api.nvim_buf_set_extmark(bufnr, NAMESPACE, lnum, 0, {
+---@param winid integer?
+---@return integer? extmark id
+local function draw_section_label(bufnr, hl_group, label, lnum, winid)
+  if not lnum then return end
+  if not api.nvim_buf_is_valid(bufnr) then return end
+  local line_count = api.nvim_buf_line_count(bufnr)
+  if lnum < 0 or lnum >= line_count then return end
+  local width = 80
+  if winid and api.nvim_win_is_valid(winid) then
+    local ok, w = pcall(api.nvim_win_get_width, winid)
+    if ok and type(w) == 'number' then width = w end
+  else
+    local ok, w = pcall(api.nvim_win_get_width, 0)
+    if ok and type(w) == 'number' then width = w end
+  end
+  local remaining_space = math.max(0, width - api.nvim_strwidth(label))
+  local ok, id = pcall(api.nvim_buf_set_extmark, bufnr, NAMESPACE, lnum, 0, {
     hl_group = hl_group,
     virt_text = { { label .. string.rep(' ', remaining_space), hl_group } },
     virt_text_pos = 'overlay',
     priority = PRIORITY,
   })
+  if ok then return id end
 end
 
 ---Highlight each part of a git conflict i.e. the incoming changes vs the current/HEAD changes
 ---TODO: should extmarks be ephemeral? or is it less expensive to save them and only re-apply
 ---them when a buffer changes since otherwise we have to reparse the whole buffer constantly
+---@param bufnr integer
 ---@param positions table
 ---@param lines string[]
-local function highlight_conflicts(positions, lines)
-  local bufnr = api.nvim_get_current_buf()
+---@param winid integer?
+local function highlight_conflicts(bufnr, positions, lines, winid)
+  if not bufnr or not api.nvim_buf_is_valid(bufnr) then return end
   M.clear(bufnr)
+
+  local line_count = api.nvim_buf_line_count(bufnr)
+  local function in_range(lnum) return type(lnum) == 'number' and lnum >= 0 and lnum < line_count end
 
   for _, position in ipairs(positions) do
     local current_start = position.current.range_start
     local current_end = position.current.range_end
     local incoming_start = position.incoming.range_start
     local incoming_end = position.incoming.range_end
+    -- Positions are derived from the decorated buffer's own lines, so bail
+    -- out if they no longer line up (e.g. buffer changed mid-redraw).
+    if not in_range(current_start) or not in_range(incoming_end) then goto continue end
     -- Add one since the index access in lines is 1 based
     local current_label = lines[current_start + 1] .. ' (Current changes)'
     local incoming_label = lines[incoming_end + 1] .. ' (Incoming changes)'
 
-    local curr_label_id = draw_section_label(bufnr, CURRENT_LABEL_HL, current_label, current_start)
+    local curr_label_id =
+      draw_section_label(bufnr, CURRENT_LABEL_HL, current_label, current_start, winid)
     local curr_id = hl_range(bufnr, CURRENT_HL, current_start, current_end + 1)
     local inc_id = hl_range(bufnr, INCOMING_HL, incoming_start, incoming_end + 1)
-    local inc_label_id = draw_section_label(bufnr, INCOMING_LABEL_HL, incoming_label, incoming_end)
+    local inc_label_id =
+      draw_section_label(bufnr, INCOMING_LABEL_HL, incoming_label, incoming_end, winid)
 
     position.marks = {
       current = { label = curr_label_id, content = curr_id },
@@ -278,11 +309,14 @@ local function highlight_conflicts(positions, lines)
     if not vim.tbl_isempty(position.ancestor) then
       local ancestor_start = position.ancestor.range_start
       local ancestor_end = position.ancestor.range_end
+      if not in_range(ancestor_start) then goto continue end
       local ancestor_label = lines[ancestor_start + 1] .. ' (Base changes)'
       local id = hl_range(bufnr, ANCESTOR_HL, ancestor_start + 1, ancestor_end + 1)
-      local label_id = draw_section_label(bufnr, ANCESTOR_LABEL_HL, ancestor_label, ancestor_start)
+      local label_id =
+        draw_section_label(bufnr, ANCESTOR_LABEL_HL, ancestor_label, ancestor_start, winid)
       position.marks.ancestor = { label = label_id, content = id }
     end
+    ::continue::
   end
 end
 
@@ -391,15 +425,20 @@ end
 ---@param bufnr integer
 ---@param range_start integer
 ---@param range_end integer
-local function parse_buffer(bufnr, range_start, range_end)
-  local lines = utils.get_buf_lines(range_start or 0, range_end or -1, bufnr)
+---@param winid integer?
+local function parse_buffer(bufnr, range_start, range_end, winid)
+  if not bufnr or not api.nvim_buf_is_valid(bufnr) then return end
+  if not utils.is_valid_buf(bufnr) then return end
+  if not visited_buffers[bufnr] then return end
+  local ok, lines = pcall(utils.get_buf_lines, range_start or 0, range_end or -1, bufnr)
+  if not ok or not lines then return end
   local prev_conflicts = visited_buffers[bufnr].positions ~= nil
       and #visited_buffers[bufnr].positions > 0
   local has_conflict, positions = detect_conflicts(lines)
 
   update_visited_buffers(bufnr, positions)
   if has_conflict then
-    highlight_conflicts(positions, lines)
+    highlight_conflicts(bufnr, positions, lines, winid)
   else
     M.clear(bufnr)
   end
@@ -473,12 +512,18 @@ local throttled_watcher = utils.throttle(1000, watch_gitdir)
 
 ---Process a buffer if the changed tick has changed
 ---@param bufnr integer?
-local function process(bufnr, range_start, range_end)
+---@param winid integer?
+local function process(bufnr, winid)
   bufnr = bufnr or api.nvim_get_current_buf()
-  if visited_buffers[bufnr] and visited_buffers[bufnr].tick == vim.b[bufnr].changedtick then
-    return
+  if not api.nvim_buf_is_valid(bufnr) then return end
+  if not utils.is_valid_buf(bufnr) then return end
+  if not visited_buffers[bufnr] then return end
+  local ok, tick = pcall(api.nvim_buf_get_var, bufnr, 'changedtick')
+  if not ok then
+    if bufnr == api.nvim_get_current_buf() then tick = vim.b[bufnr].changedtick end
   end
-  parse_buffer(bufnr, range_start, range_end)
+  if tick ~= nil and visited_buffers[bufnr].tick == tick then return end
+  parse_buffer(bufnr, nil, nil, winid)
 end
 
 -----------------------------------------------------------------------------//
@@ -669,8 +714,18 @@ function M.setup(user_config)
 
   api.nvim_set_decoration_provider(NAMESPACE, {
     on_buf = function(_, bufnr, _) return utils.is_valid_buf(bufnr) end,
-    on_win = function(_, _, bufnr, _, _)
-      if visited_buffers[bufnr] then process(bufnr) end
+    on_win = function(_, winid, bufnr, _, _)
+      -- NOTE: on_win args are ("win", winid, bufnr, topline, botline).
+      -- Diffview (and other multi-window views) decorates buffers that are
+      -- not the current one, so the buffer being decorated must be used
+      -- explicitly. Using the current buffer here placed extmarks at stale
+      -- line numbers and raised `Invalid 'line': out of range`.
+      if not bufnr or not api.nvim_buf_is_valid(bufnr) then return false end
+      if not utils.is_valid_buf(bufnr) then return false end
+      if visited_buffers[bufnr] then
+        local ok, err = pcall(process, bufnr, winid)
+        if not ok and config.debug then utils.notify(tostring(err), 'error') end
+      end
     end,
   })
 end
